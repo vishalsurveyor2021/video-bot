@@ -26,7 +26,7 @@ jobs:
 
       - name: Render video
         env:
-          PAYLOAD: ${{ github.event.client_payload.raw }}
+          PAYLOAD: ${{ toJSON(github.event.client_payload.data) }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python render.py
 
