@@ -185,9 +185,13 @@ def clip(img, audio, caption, font, out, idx, ai_clip=None):
 
 
 async def main():
-    raw = urllib.parse.unquote_plus(os.environ["PAYLOAD"]).strip()
-    raw = raw.removeprefix("```json").removesuffix("```").strip()
-    data = json.loads(raw)
+       raw = os.environ["PAYLOAD"].strip()
+   try:
+       data = json.loads(raw)
+   except ValueError:
+       raw = urllib.parse.unquote_plus(raw).strip()
+       raw = raw.removeprefix("```json").removesuffix("```").strip()
+       data = json.loads(raw)
     scenes = data["scenes"][:8]
     os.makedirs(OUT, exist_ok=True)
     os.makedirs(WORK, exist_ok=True)
