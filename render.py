@@ -1,6 +1,6 @@
 """Hybrid renderer: AI image -> (free HF GPU image-to-video clip, else zoom fallback) + Hindi voice + captions.
 
-Input: env PAYLOAD (URL-encoded Groq JSON). Output: out/video.mp4, out/meta.json
+Input: env PAYLOAD (Groq JSON). Output: out/video.mp4, out/meta.json
 Optional env: HF_TOKEN (Hugging Face token), HF_SPACES (comma separated Space ids), VOICE
 """
 import asyncio
@@ -18,7 +18,6 @@ import httpx
 W, H, FPS = 1080, 1920, 30
 VOICE = os.getenv("VOICE", "hi-IN-MadhurNeural")  # female: hi-IN-SwaraNeural
 HF_TOKEN = os.getenv("HF_TOKEN", "")
-# Image-to-video Spaces tried in order. Names can disappear: change HF_SPACES if needed.
 HF_SPACES = [s.strip() for s in os.getenv("HF_SPACES", "ChopperBlu/wan22-i2v,multimodalart/wan2-2-fp8da-aoti-preview").split(",") if s.strip()]
 CLIP_TIMEOUT = int(os.getenv("CLIP_TIMEOUT", "300"))
 IMAGE_URL = os.getenv(
@@ -61,18 +60,74 @@ async def voice(text, out):
             await asyncio.sleep(3)
 
 
-async def image(client, prompt, out):
-    url = IMAGE_URL.format(prompt=urllib.parse.quote(prompt + STYLE_SUFFIX), seed=SEED)
-    for _ in range(3):
+IMG_SPACES = [x.strip() for x in os.getenv("HF_IMAGE_SPACES", "black-forest-labs/FLUX.1-schnell").split(",") if x.strip()]
+
+
+def _hf_client(space):
+    from gradio_client import Client
+    try:
+        return Client(space, hf_token=HF_TOKEN, verbose=False)
+    except TypeError:
+        return Client(space, token=HF_TOKEN, verbose=False)
+
+
+def hf_image(prompt, out):
+    """Fallback image source: free FLUX Space on Hugging Face (auto-detects the text->image endpoint)."""
+    for space in IMG_SPACES:
         try:
-            r = await client.get(url, timeout=90, follow_redirects=True)
+            client = _hf_client(space)
+            info = client.view_api(return_format="dict", print_info=False)
+            for api_name, ep in info.get("named_endpoints", {}).items():
+                params = ep.get("parameters", [])
+                rets = [r.get("component") for r in ep.get("returns", [])]
+                if "Image" not in rets or "Image" in [p.get("component") for p in params]:
+                    continue
+                kwargs, first_text, ok = {}, True, True
+                for p in params:
+                    n, comp = p["parameter_name"], p.get("component")
+                    lab = (p.get("label") or "").lower()
+                    if comp == "Textbox" and "negative" not in lab and "negative" not in n and first_text:
+                        kwargs[n], first_text = prompt, False
+                    elif n == "width":
+                        kwargs[n] = 768
+                    elif n == "height":
+                        kwargs[n] = 1344
+                    elif p.get("parameter_has_default"):
+                        kwargs[n] = p["parameter_default"]
+                    else:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                res = client.submit(api_name=api_name, **kwargs).result(timeout=240)
+                path = res[0] if isinstance(res, (list, tuple)) else res
+                if isinstance(path, dict):
+                    path = path.get("path") or path.get("url")
+                if path and os.path.exists(path):
+                    run(["ffmpeg", "-y", "-i", path, out])
+                    print(f"  image OK via HF {space}")
+                    return True
+        except Exception as e:
+            print(f"  HF image {space} failed: {str(e)[:150]}")
+    return False
+
+
+async def image(client, prompt, out):
+    """Pollinations (sequential, patient retries) -> HF FLUX Space -> dark background."""
+    url = IMAGE_URL.format(prompt=urllib.parse.quote(prompt + STYLE_SUFFIX), seed=SEED)
+    for attempt in range(5):
+        try:
+            r = await client.get(url, timeout=120, follow_redirects=True)
             if r.status_code == 200 and len(r.content) > 5000 and r.content[:3] in (b"\xff\xd8\xff", b"\x89PN"):
                 open(out, "wb").write(r.content)
                 return
-        except httpx.HTTPError:
-            pass
-        await asyncio.sleep(3)
-    print("image failed, using fallback background:", prompt[:60])
+            print(f"  pollinations attempt {attempt+1}: HTTP {r.status_code}")
+        except httpx.HTTPError as e:
+            print(f"  pollinations attempt {attempt+1}: {type(e).__name__}")
+        await asyncio.sleep(8 + attempt * 6)
+    if HF_TOKEN and await asyncio.to_thread(hf_image, prompt + STYLE_SUFFIX, out):
+        return
+    print("image failed everywhere, using dark background:", prompt[:60])
     run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=0x1b1b2f:s={W}x{H}", "-frames:v", "1", out])
 
 
@@ -168,9 +223,15 @@ def clip(img, audio, caption, font, out, idx, ai_clip=None):
         inputs = ["-i", ai_clip, "-i", audio]
     else:
         frames = int(dur * FPS)
-        zoom = "max(1.18-0.0007*on,1.0)" if idx % 2 else "min(1.0+0.0007*on,1.18)"
-        base = (f"scale=1296:2304:force_original_aspect_ratio=increase,crop=1296:2304,"
-                f"zoompan=z='{zoom}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={W}x{H}:fps={FPS}")
+        moves = [
+            "z='min(1.0+0.0008*on,1.22)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
+            "z='max(1.22-0.0008*on,1.0)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
+            f"z='1.2':x='(iw-iw/zoom)*on/{frames}':y='ih/2-(ih/zoom/2)'",
+            f"z='1.2':x='(iw-iw/zoom)*(1-on/{frames})':y='ih/2-(ih/zoom/2)'",
+        ]
+        base = (f"crop=iw:ih*0.94:0:0,scale=1296:2304:force_original_aspect_ratio=increase,crop=1296:2304,"
+                f"zoompan={moves[idx % 4]}:d={frames}:s={W}x{H}:fps={FPS},"
+                f"vignette=PI/5,noise=alls=7:allf=t")
         inputs = ["-i", img, "-i", audio]
     vf = (
         f"{base},"
@@ -185,20 +246,23 @@ def clip(img, audio, caption, font, out, idx, ai_clip=None):
 
 
 async def main():
-    raw = urllib.parse.unquote_plus(os.environ["PAYLOAD"]).strip()
-    raw = raw.removeprefix("```json").removesuffix("```").strip()
-    data = json.loads(raw)
+    raw = os.environ["PAYLOAD"].strip()
+    try:
+        data = json.loads(raw)
+    except ValueError:  # old format: URL-encoded JSON string
+        raw = urllib.parse.unquote_plus(raw).strip()
+        raw = raw.removeprefix("```json").removesuffix("```").strip()
+        data = json.loads(raw)
     scenes = data["scenes"][:8]
     os.makedirs(OUT, exist_ok=True)
     os.makedirs(WORK, exist_ok=True)
     font = find_font()
 
     async with httpx.AsyncClient() as client:
-        tasks = []
-        for i, s in enumerate(scenes):
-            tasks.append(voice(s["scene_text"], f"{WORK}/a{i}.mp3"))
-            tasks.append(image(client, s["image_prompt"], f"{WORK}/i{i}.jpg"))
-        await asyncio.gather(*tasks)
+        await asyncio.gather(*[voice(sc["scene_text"], f"{WORK}/a{i}.mp3") for i, sc in enumerate(scenes)])
+        for i, sc in enumerate(scenes):  # one at a time: free image servers rate-limit parallel requests
+            print(f"image {i+1}/{len(scenes)}")
+            await image(client, sc["image_prompt"], f"{WORK}/i{i}.jpg")
 
     # AI video clips one by one (free GPU quota); stop trying after 2 failures in a row
     ai = {}
